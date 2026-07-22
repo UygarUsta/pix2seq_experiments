@@ -1,0 +1,94 @@
+{
+  "iou_threshold": 0.5,
+  "overall": {
+    "tp": 1344,
+    "fp": 189,
+    "fn": 188,
+    "precision": 0.8767,
+    "recall": 0.8773,
+    "f1": 0.877,
+    "mean_iou": 0.9219
+  },
+  "per_class": {
+    "qr": {
+      "tp": 182,
+      "fp": 37,
+      "fn": 37,
+      "precision": 0.8311,
+      "recall": 0.8311,
+      "mean_iou": 0.9656
+    },
+    "menfaat": {
+      "tp": 190,
+      "fp": 29,
+      "fn": 29,
+      "precision": 0.8676,
+      "recall": 0.8676,
+      "mean_iou": 0.9529
+    },
+    "azami_yuk": {
+      "tp": 192,
+      "fp": 27,
+      "fn": 27,
+      "precision": 0.8767,
+      "recall": 0.8767,
+      "mean_iou": 0.9068
+    },
+    "kullanim_amaci": {
+      "tp": 189,
+      "fp": 30,
+      "fn": 30,
+      "precision": 0.863,
+      "recall": 0.863,
+      "mean_iou": 0.9009
+    },
+    "net_agirlik": {
+      "tp": 190,
+      "fp": 29,
+      "fn": 29,
+      "precision": 0.8676,
+      "recall": 0.8676,
+      "mean_iou": 0.9021
+    },
+    "ruhsat": {
+      "tp": 210,
+      "fp": 9,
+      "fn": 9,
+      "precision": 0.9589,
+      "recall": 0.9589,
+      "mean_iou": 0.9312
+    },
+    "romork_azami_yuk": {
+      "tp": 191,
+      "fp": 28,
+      "fn": 27,
+      "precision": 0.8721,
+      "recall": 0.8761,
+      "mean_iou": 0.8951
+    },
+    "plaka": {
+      "tp": 0,
+      "fp": 0,
+      "fn": 0,
+      "precision": 0.0,
+      "recall": 0.0,
+      "mean_iou": 0.0
+    },
+    "tc": {
+      "tp": 0,
+      "fp": 0,
+      "fn": 0,
+      "precision": 0.0,
+      "recall": 0.0,
+      "mean_iou": 0.0
+    },
+    "seri_no": {
+      "tp": 0,
+      "fp": 0,
+      "fn": 0,
+      "precision": 0.0,
+      "recall": 0.0,
+      "mean_iou": 0.0
+    }
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "output_mode": "both",
+  "tokens_per_object": 13,
+  "max_objects": 15,
+  "num_bins": 1000,
+  "noise_augmentation": true
+}
