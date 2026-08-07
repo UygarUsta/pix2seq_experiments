@@ -1,0 +1,273 @@
+import torch
+import torchvision.transforms.functional as TF
+from torchvision import transforms
+from PIL import Image, ImageDraw, ImageFont
+import matplotlib.pyplot as plt
+import os
+from training_pix2seq_bbox  import (
+    Pix2SeqModel, VOCAB_SIZE, NUM_BINS, BOS_TOKEN, EOS_TOKEN, 
+    LABEL_TO_ID, ID_TO_LABEL, IMG_SIZE, MAX_OBJECTS, TOKENS_PER_OBJ
+)
+
+def dequantize(token, max_size, num_bins):
+    return (token / (num_bins - 1)) * max_size
+
+
+def pad_to_square_infer(img):
+    w, h = img.size
+    max_dim = max(w, h)
+    new_img = Image.new("RGB", (max_dim, max_dim), (128, 128, 128))
+    new_img.paste(img, (0, 0))
+    return new_img, max_dim
+
+# def tokens_to_predictions(tokens, max_dim):
+#     """
+#     De-tokenize a flat token list into predictions.
+#     Coordinates are returned in padded-square space [0, max_dim].
+#     """
+#     img_h_model, img_w_model = IMG_SIZE  # 512, 512
+
+#     predictions = []
+#     for i in range(0, len(tokens) - (len(tokens) % 9), 9):
+#         obj_tokens = tokens[i:i+9]
+
+#         coords_valid = all(0 <= obj_tokens[j] < NUM_BINS for j in range(8))
+#         class_valid  = NUM_BINS <= obj_tokens[8] < NUM_BINS + len(LABEL_TO_ID)
+#         if not coords_valid or not class_valid:
+#             continue
+
+#         class_id = obj_tokens[8] - NUM_BINS
+#         label    = ID_TO_LABEL.get(class_id, f"Bilinmeyen_{class_id}")
+        
+#         # --- YENİ EKLENEN KISIM ---
+#         # Model bu kutunun bir "noise" (sahte nesne / gürültü) olduğuna karar verdiyse,
+#         # bunu tahminler listesine eklemeden atlıyoruz.
+#         if label == "noise":
+#             continue
+#         # --------------------------
+
+#         points = []
+#         for j in range(0, 8, 2):
+#             x_tok = obj_tokens[j]
+#             y_tok = obj_tokens[j + 1]
+
+#             x_model = dequantize(x_tok, img_w_model, NUM_BINS)
+#             y_model = dequantize(y_tok, img_h_model, NUM_BINS)
+
+#             x_padded = x_model * (max_dim / img_w_model)
+#             y_padded = y_model * (max_dim / img_h_model)
+
+#             points.append((x_padded, y_padded))
+
+#         predictions.append({"label": label, "points": points})
+
+#     return predictions
+
+def tokens_to_predictions(tokens, max_dim):
+    img_h_model, img_w_model = IMG_SIZE
+    predictions = []
+
+    for i in range(0, len(tokens) - (len(tokens) % 5), 5):
+        t = tokens[i:i+5]
+
+        if not all(0 <= t[j] < NUM_BINS for j in range(4)):
+            continue
+        if not (NUM_BINS <= t[4] < NUM_BINS + len(LABEL_TO_ID)):
+            continue
+
+        label = ID_TO_LABEL.get(t[4] - NUM_BINS)
+        if label is None:
+            continue
+
+        scale_x = (max_dim / img_w_model)
+        scale_y = (max_dim / img_h_model)
+
+        x_min = dequantize(t[0], img_w_model, NUM_BINS) * scale_x
+        y_min = dequantize(t[1], img_h_model, NUM_BINS) * scale_y
+        x_max = dequantize(t[2], img_w_model, NUM_BINS) * scale_x
+        y_max = dequantize(t[3], img_h_model, NUM_BINS) * scale_y
+
+        if x_max <= x_min or y_max <= y_min:   # model emitted an invalid box
+            continue
+
+        predictions.append({"label": label, "box": [x_min, y_min, x_max, y_max]})
+
+    return predictions
+
+def draw_predictions(padded_img, predictions, orig_w, orig_h):
+    """
+    Draw predictions on the padded image then crop back to original size.
+    This avoids any coordinate remapping — everything stays in padded space.
+    """
+    # FIX: draw on the padded image, not original_img.
+    #      Coordinates from the model are in padded space so this is exact.
+    result = padded_img.copy()
+    draw   = ImageDraw.Draw(result)
+
+    # for pred in predictions:
+    #     pts   = pred["points"]
+    #     label = pred["label"]
+
+    #     flat_points = [coord for pt in pts for coord in pt]
+    #     draw.polygon(flat_points, outline="red", width=3)
+
+    #     min_x = min(p[0] for p in pts)
+    #     min_y = min(p[1] for p in pts)
+
+    #     draw.rectangle([min_x, max(0, min_y - 15), min_x + 80, min_y], fill="red")
+    #     draw.text((min_x + 2, max(0, min_y - 15)), label, fill="white")
+    for pred in predictions:
+        x_min, y_min, x_max, y_max = pred["box"]
+        draw.rectangle([x_min, y_min, x_max, y_max], outline="red", width=3)
+        draw.rectangle([x_min, max(0, y_min - 15), x_min + 90, y_min], fill="red")
+        draw.text((x_min + 2, max(0, y_min - 15)), pred["label"], fill="white")
+
+    # FIX: crop back to original image dimensions (removes gray padding)
+    result = result.crop((0, 0, orig_w, orig_h))
+    return result
+
+
+def run_autoregressive(model, img_tensor, max_seq_len, device):
+    sequence = [BOS_TOKEN]
+    with torch.no_grad():
+        for _ in range(max_seq_len):
+            tgt_seq    = torch.tensor([sequence], dtype=torch.long).to(device)
+            logits     = model(img_tensor, tgt_seq)
+            next_token = torch.argmax(logits[0, -1, :]).item()
+            sequence.append(next_token)
+            if next_token == EOS_TOKEN:
+                break
+    return sequence
+
+
+def resolve_image_path(image_path):
+    """Try common extensions if path doesn't exist or is a json."""
+    if not os.path.exists(image_path) or image_path.endswith(".json"):
+        base = os.path.splitext(image_path)[0]
+        for ext in [".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".JPG", ".JPEG", ".PNG"]:
+            if os.path.exists(base + ext):
+                return base + ext
+    return image_path
+
+
+def preprocess_image(image_path):
+    """Load, pad, resize, normalize. Returns (img_tensor, padded_img, orig_w, orig_h, max_dim)."""
+    original_img        = Image.open(image_path).convert("RGB")
+    orig_w, orig_h      = original_img.size
+    padded_img, max_dim = pad_to_square_infer(original_img)
+
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    img_tensor = TF.resize(padded_img, IMG_SIZE)
+    img_tensor = transform(img_tensor).unsqueeze(0)
+    return img_tensor, padded_img, orig_w, orig_h, max_dim
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+def predict_and_draw(image_path, model_path, original_image_size=None, folder_mode=False):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Inference {device} cihazında yapılıyor...")
+
+    max_seq_len = 1 + (TOKENS_PER_OBJ * MAX_OBJECTS) + 1
+    model = Pix2SeqModel(vocab_size=VOCAB_SIZE, max_seq_len=max_seq_len).to(device)
+    # state_dict = torch.load(model_path, map_location=device)
+    # clean_state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+    # model.load_state_dict(clean_state_dict)
+    #model.load_state_dict(torch.load(model_path, map_location=device))
+    state_dict = torch.load(model_path, map_location=device)
+    clean_state_dict = {k.replace('_orig_mod.', '').replace('module.', ''): v for k, v in state_dict.items()}
+    model.load_state_dict(clean_state_dict)
+    model.eval()
+
+    image_path = resolve_image_path(image_path)
+    img_tensor, padded_img, orig_w, orig_h, max_dim = preprocess_image(image_path)
+    img_tensor = img_tensor.to(device)
+
+    sequence = run_autoregressive(model, img_tensor, max_seq_len, device)
+    print(f"Üretilen Ham Tokenlar: {sequence}")
+
+    tokens      = sequence[1:-1] if sequence[-1] == EOS_TOKEN else sequence[1:]
+    predictions = tokens_to_predictions(tokens, max_dim)
+
+    # FIX: draw on padded image and crop — replaces drawing on original_img
+    result_img  = draw_predictions(padded_img, predictions, orig_w, orig_h)
+
+    if not folder_mode:
+        output_path = "inference_result.jpg"
+    else:
+        os.makedirs("test_output", exist_ok=True)
+        output_path = f"test_output/{os.path.basename(image_path)}"
+
+    result_img.save(output_path)
+    print(f"\nİşlem tamam! Sonuç '{output_path}' dosyasına kaydedildi.")
+
+
+def predict_and_draw_nomodel(image_path, model, device, folder_mode=False):
+    # FIX: device is now an explicit parameter — was undefined global in original
+    max_seq_len = 1 + (TOKENS_PER_OBJ * MAX_OBJECTS) + 1
+
+    image_path = resolve_image_path(image_path)
+    if not os.path.exists(image_path):
+        print(f"  Atlandı (bulunamadı): {image_path}")
+        return
+
+    img_tensor, padded_img, orig_w, orig_h, max_dim = preprocess_image(image_path)
+    img_tensor = img_tensor.to(device)
+
+    sequence = run_autoregressive(model, img_tensor, max_seq_len, device)
+    print(f"Üretilen Ham Tokenlar: {sequence}")
+
+    tokens      = sequence[1:-1] if sequence[-1] == EOS_TOKEN else sequence[1:]
+    predictions = tokens_to_predictions(tokens, max_dim)
+
+    # FIX: same draw fix as predict_and_draw
+    result_img  = draw_predictions(padded_img, predictions, orig_w, orig_h)
+
+    if not folder_mode:
+        output_path = "inference_result.jpg"
+    else:
+        os.makedirs("test_output", exist_ok=True)
+        output_path = f"test_output/{os.path.basename(image_path)}"
+
+    result_img.save(output_path)
+    print(f"\nİşlem tamam! Sonuç '{output_path}' dosyasına kaydedildi.")
+
+
+if __name__ == "__main__":
+    TEST_IMAGE_PATH = "/home/uygarusta/datasets/card_merged_datasets/merged_datasets/ruhsat_1ece4a35-2228-4f86-b6de-b80d3c066745.jpg" 
+    MODEL_PATH      = "pix2seq_best_map.pth" #"pix2seq_best.pth"
+
+    predict_and_draw(TEST_IMAGE_PATH, MODEL_PATH)
+
+    FOLDER_PATH = "" #"/home/uygarusta/Oriented-Centernet/pix2seq/animals.v2-release.coco/train" #"/home/uygarusta/Oriented-Centernet/pix2seq/Website Screenshots.v1-raw.coco/valid"
+    if FOLDER_PATH:
+        print("FOLDER_PATH active!")
+        from glob import glob
+        from tqdm import tqdm
+        for image in tqdm(glob(os.path.join(FOLDER_PATH, "*"))):
+            predict_and_draw(image, MODEL_PATH, folder_mode=True)
+
+    VAL_JSON = "val_split.json"
+    if VAL_JSON:
+        print("VAL_JSON active!")
+        import json
+        from tqdm import tqdm
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        max_seq_len = 1 + (TOKENS_PER_OBJ * MAX_OBJECTS) + 1
+        model = Pix2SeqModel(vocab_size=VOCAB_SIZE, max_seq_len=max_seq_len).to(device)
+        model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+        model.eval()
+
+        with open(VAL_JSON) as f:
+            val_filenames = json.load(f)["filenames"]
+
+        DATA_DIR = "/home/uygarusta/datasets/card_merged_datasets/merged_datasets"
+        for fname in tqdm(val_filenames):
+            full_path = os.path.join(DATA_DIR, fname)
+            # FIX: pass device explicitly — was undefined in original
+            predict_and_draw_nomodel(full_path, model, device, folder_mode=True)
