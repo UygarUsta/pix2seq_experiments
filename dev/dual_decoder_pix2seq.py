@@ -7,12 +7,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from torch.optim.lr_scheduler import OneCycleLR
 import torchvision.models as models
-from torchvision import transforms
 from PIL import Image, ImageDraw
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from tqdm import tqdm
+
+from instance_seg_eval_utils_dual_pix2seq import evaluate_dual
 
 # --- CONFIGURATION ---
 JSON_DIR       = "/home/uygarusta/datasets/card_merged_datasets/merged_datasets/"
@@ -34,11 +36,10 @@ BOS_TOKEN   = VOCAB_SIZE - 3
 EOS_TOKEN   = VOCAB_SIZE - 2
 PAD_TOKEN   = VOCAB_SIZE - 1
 
-NUM_POLY_PTS     = 16
+NUM_POLY_PTS        = 16
 BOX_TOKENS_PER_OBJ  = 5
 POLY_TOKENS_PER_OBJ = 2 * NUM_POLY_PTS     # 32
 MAX_BOX_SEQ_LEN     = 1 + BOX_TOKENS_PER_OBJ * MAX_OBJECTS + 1  # 52
-# Mask decoder sequence per instance: [BOS, x0, y0, x1, y1, cls, p0_x, p0_y, ..., pK_x, pK_y, EOS]
 MAX_MASK_SEQ_LEN    = 1 + BOX_TOKENS_PER_OBJ + POLY_TOKENS_PER_OBJ + 1  # 39
 
 MIN_SIDE      = 2.0
@@ -141,7 +142,7 @@ val_transform = A.Compose([
 ], keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DATASET FOR DUAL DECODER
+# DATASET
 # ─────────────────────────────────────────────────────────────────────────────
 
 class DualPix2SeqDataset(Dataset):
@@ -234,9 +235,7 @@ class DualPix2SeqDataset(Dataset):
         records.sort(key=lambda r: (r["box"][1], r["box"][0]))
         records = records[:self.max_objects]
 
-        # 1. Build Bounding Box Sequence
-        box_seq = [BOS_TOKEN]
-        # 2. Build Mask Sequences (One per object: [BOS, x0, y0, x1, y1, cls, px0, py0, ... pxK-1, pyK-1, EOS])
+        box_seq   = [BOS_TOKEN]
         mask_seqs = []
 
         for rec in records:
@@ -259,13 +258,11 @@ class DualPix2SeqDataset(Dataset):
 
         box_seq.append(EOS_TOKEN)
 
-        # Pad Box Sequence
         if len(box_seq) < MAX_BOX_SEQ_LEN:
             box_seq.extend([PAD_TOKEN] * (MAX_BOX_SEQ_LEN - len(box_seq)))
         else:
             box_seq = box_seq[:MAX_BOX_SEQ_LEN - 1] + [EOS_TOKEN]
 
-        # Pad Mask Sequences to [MAX_OBJECTS, MAX_MASK_SEQ_LEN]
         padded_masks = []
         for seq in mask_seqs:
             if len(seq) < MAX_MASK_SEQ_LEN:
@@ -286,7 +283,7 @@ class DualPix2SeqDataset(Dataset):
         )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DUAL DECODER MODEL ARCHITECTURE
+# MODEL
 # ─────────────────────────────────────────────────────────────────────────────
 
 class PositionalEncoding(nn.Module):
@@ -314,20 +311,16 @@ class DualPix2SeqModel(nn.Module):
         grid_w = IMG_SIZE[1] // 32
         self.pos_emb = nn.Parameter(torch.randn(1, grid_h * grid_w, hidden_dim))
 
-        # Shared Token Embedding & Positional Encoding
         self.embedding        = nn.Embedding(vocab_size, hidden_dim, padding_idx=PAD_TOKEN)
         self.seq_pos_encoding = PositionalEncoding(hidden_dim, max_len=max(MAX_BOX_SEQ_LEN, MAX_MASK_SEQ_LEN))
         self.emb_dropout      = nn.Dropout(0.1)
 
-        # Decoder 1: Bounding Box
         box_layer = nn.TransformerDecoderLayer(d_model=hidden_dim, nhead=nheads, batch_first=True, dropout=0.1)
         self.box_decoder = nn.TransformerDecoder(box_layer, num_layers=num_layers)
 
-        # Decoder 2: Mask Polygon (Box Conditioned)
         mask_layer = nn.TransformerDecoderLayer(d_model=hidden_dim, nhead=nheads, batch_first=True, dropout=0.1)
         self.mask_decoder = nn.TransformerDecoder(mask_layer, num_layers=num_layers)
 
-        # Output projection (Shared vocab space)
         self.fc_out = nn.Linear(hidden_dim, vocab_size)
 
     def encode(self, images):
@@ -342,21 +335,15 @@ class DualPix2SeqModel(nn.Module):
         return self.fc_out(out)
 
     def forward_masks(self, memory, mask_seqs):
-        """
-        memory:    [B, N_patches, D]
-        mask_seqs: [B, N_objs, Seq_len] -> reshaped to [B * N_objs, Seq_len]
-        """
         B, N_objs, S = mask_seqs.shape
         D = memory.size(-1)
-        
         flat_mask_seqs = mask_seqs.view(B * N_objs, S)
         flat_memory    = memory.unsqueeze(1).repeat(1, N_objs, 1, 1).view(B * N_objs, -1, D)
 
         tgt_mask = nn.Transformer.generate_square_subsequent_mask(S).to(memory.device)
         tgt_emb  = self.emb_dropout(self.seq_pos_encoding(self.embedding(flat_mask_seqs)))
         out      = self.mask_decoder(tgt=tgt_emb, memory=flat_memory, tgt_mask=tgt_mask)
-        
-        logits = self.fc_out(out)
+        logits   = self.fc_out(out)
         return logits.view(B, N_objs, S, -1)
 
     def forward(self, images, box_targets, mask_targets):
@@ -366,22 +353,15 @@ class DualPix2SeqModel(nn.Module):
         return box_logits, mask_logits
 
 # ─────────────────────────────────────────────────────────────────────────────
-# INFERENCE PIPELINE (BBOX AR -> BATCHED MASK AR)
+# INFERENCE DECODING
 # ─────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
 def dual_ar_decode(model, images, device):
-    """
-    1. Decoder 1 emits box sequence autoregressively.
-    2. Parsed boxes are grouped and used as condition prefixes for Decoder 2.
-    3. Decoder 2 predicts all polygon vertices for all instances simultaneously.
-    """
     model.eval()
     B = images.size(0)
     memory = model.encode(images)
-    D = memory.size(-1)
 
-    # ── Stage 1: Decode Boxes ──
     box_seq = torch.full((B, 1), BOS_TOKEN, dtype=torch.long, device=device)
     finished = torch.zeros(B, dtype=torch.bool, device=device)
 
@@ -398,7 +378,6 @@ def dual_ar_decode(model, images, device):
         if finished.all():
             break
 
-    # ── Stage 2: Parse Boxes & Setup Mask Decoding ──
     all_image_preds = []
     
     for b in range(B):
@@ -427,10 +406,9 @@ def dual_ar_decode(model, images, device):
             all_image_preds.append([])
             continue
 
-        # ── Stage 3: Parallel Instance Mask Decoding for Batch Element 'b' ──
         N_inst = len(instances)
-        prefixes = torch.tensor([inst["raw_prefix"] for inst in instances], dtype=torch.long, device=device) # [N_inst, 6]
-        inst_memory = memory[b:b+1].repeat(N_inst, 1, 1) # [N_inst, N_patches, D]
+        prefixes = torch.tensor([inst["raw_prefix"] for inst in instances], dtype=torch.long, device=device)
+        inst_memory = memory[b:b+1].repeat(N_inst, 1, 1)
 
         cur_mask_seq = prefixes
         inst_finished = torch.zeros(N_inst, dtype=torch.bool, device=device)
@@ -448,7 +426,6 @@ def dual_ar_decode(model, images, device):
             if inst_finished.all():
                 break
 
-        # Convert decoded vertices back to image coordinates
         img_results = []
         for i_idx, inst in enumerate(instances):
             poly_toks = cur_mask_seq[i_idx, 6:].tolist()
@@ -474,55 +451,138 @@ def dual_ar_decode(model, images, device):
     return all_image_preds
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TRAINING LOOP
+# TRAINING SCRIPT
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Dual-Decoder Pix2seq initialized on {device}.")
+    print(f"Dual-Decoder Pix2seq starting on {device}...")
 
-    train_dataset = DualPix2SeqDataset(JSON_DIR, IMG_DIR, transform=train_transform)
-    val_dataset   = DualPix2SeqDataset(JSON_DIR, IMG_DIR, transform=val_transform)
+    # Load / Build Dataset Splits
+    all_json_files = [f for f in os.listdir(JSON_DIR) if f.endswith('.json')]
+    if os.path.exists(VAL_SPLIT_PATH):
+        print(f"Loading existing val split: {VAL_SPLIT_PATH}")
+        with open(VAL_SPLIT_PATH) as f:
+            saved = json.load(f)
+        val_files_set = set(saved["filenames"])
+        train_files   = [f for f in all_json_files if f not in val_files_set]
+        val_files     = [f for f in all_json_files if f in val_files_set]
+    else:
+        print(f"Creating new val split -> {VAL_SPLIT_PATH}")
+        random.shuffle(all_json_files)
+        train_size  = int(0.9 * len(all_json_files))
+        train_files = all_json_files[:train_size]
+        val_files   = all_json_files[train_size:]
+        with open(VAL_SPLIT_PATH, "w") as f:
+            json.dump({"filenames": val_files}, f, indent=2)
 
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
-    val_loader   = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+    train_dataset            = DualPix2SeqDataset(JSON_DIR, IMG_DIR, transform=train_transform)
+    train_dataset.json_files = train_files
 
-    model = DualPix2SeqModel(vocab_size=VOCAB_SIZE).to(device)
+    val_dataset            = DualPix2SeqDataset(JSON_DIR, IMG_DIR, transform=val_transform)
+    val_dataset.json_files = val_files
+
+    print(f"Train: {len(train_dataset)} | Val: {len(val_dataset)}")
+
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,  num_workers=8, pin_memory=True)
+    val_loader   = DataLoader(val_dataset,   batch_size=BATCH_SIZE, shuffle=False, num_workers=8, pin_memory=True)
+
+    model     = DualPix2SeqModel(vocab_size=VOCAB_SIZE).to(device)
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN, label_smoothing=0.1)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW([
+        {'params': model.encoder.parameters(),          'lr': 3e-5},
+        {'params': model.enc_proj.parameters(),         'lr': LEARNING_RATE},
+        {'params': [model.pos_emb],                     'lr': LEARNING_RATE},
+        {'params': model.embedding.parameters(),        'lr': LEARNING_RATE},
+        {'params': model.seq_pos_encoding.parameters(), 'lr': LEARNING_RATE},
+        {'params': model.box_decoder.parameters(),      'lr': LEARNING_RATE},
+        {'params': model.mask_decoder.parameters(),     'lr': LEARNING_RATE},
+        {'params': model.fc_out.parameters(),           'lr': LEARNING_RATE},
+    ], weight_decay=1e-4)
 
-    for epoch in range(EPOCHS):
+    total_steps = len(train_loader) * EPOCHS
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=[3e-5, LEARNING_RATE, LEARNING_RATE, LEARNING_RATE,
+                LEARNING_RATE, LEARNING_RATE, LEARNING_RATE, LEARNING_RATE],
+        total_steps=total_steps,
+        pct_start=0.05
+    )
+
+    EVAL_EVERY    = 4
+    best_val_loss = float("inf")
+    best_segm_map = 0.0
+
+    epoch_bar = tqdm(range(EPOCHS), desc="Epochs", unit="epoch")
+
+    for epoch in epoch_bar:
+        # ── Train ─────────────────────────────────────────────────────────────
         model.train()
         train_loss = 0.0
 
-        for images, box_targets, mask_targets, num_objs in tqdm(train_loader, desc=f"Epoch {epoch+1}"):
+        for images, box_targets, mask_targets, _ in tqdm(train_loader, desc=f"Train {epoch+1}/{EPOCHS}", leave=False):
             images       = images.to(device).float()
             box_targets  = box_targets.to(device)
             mask_targets = mask_targets.to(device)
 
-            # Slicing for teacher forcing
             box_in, box_out   = box_targets[:, :-1], box_targets[:, 1:]
             mask_in, mask_out = mask_targets[:, :, :-1], mask_targets[:, :, 1:]
 
             optimizer.zero_grad()
-            
             box_logits, mask_logits = model(images, box_in, mask_in)
 
-            # 1. Box Loss
-            loss_box = criterion(box_logits.reshape(-1, VOCAB_SIZE), box_out.reshape(-1))
-
-            # 2. Mask Loss (Only computed on active, non-padded objects)
+            loss_box  = criterion(box_logits.reshape(-1, VOCAB_SIZE), box_out.reshape(-1))
             loss_mask = criterion(mask_logits.reshape(-1, VOCAB_SIZE), mask_out.reshape(-1))
-
-            # Weighted Joint Loss
-            loss = loss_box + 2.0 * loss_mask
+            loss      = loss_box + 2.0 * loss_mask
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
+            scheduler.step()
 
             train_loss += loss.item()
 
-        print(f"Epoch {epoch+1} finished. Avg Loss: {train_loss / len(train_loader):.4f}")
-        torch.save(model.state_dict(), "dual_pix2seq_best.pth")
+        avg_train_loss = train_loss / len(train_loader)
+
+        # ── Validation Loss ───────────────────────────────────────────────────
+        model.eval()
+        val_loss = 0.0
+
+        with torch.no_grad():
+            for images, box_targets, mask_targets, _ in val_loader:
+                images       = images.to(device).float()
+                box_targets  = box_targets.to(device)
+                mask_targets = mask_targets.to(device)
+
+                box_in, box_out   = box_targets[:, :-1], box_targets[:, 1:]
+                mask_in, mask_out = mask_targets[:, :, :-1], mask_targets[:, :, 1:]
+
+                box_logits, mask_logits = model(images, box_in, mask_in)
+                loss_box  = criterion(box_logits.reshape(-1, VOCAB_SIZE), box_out.reshape(-1))
+                loss_mask = criterion(mask_logits.reshape(-1, VOCAB_SIZE), mask_out.reshape(-1))
+                val_loss += (loss_box + 2.0 * loss_mask).item()
+
+        avg_val_loss = val_loss / len(val_loader)
+
+        epoch_bar.set_postfix(train=f"{avg_train_loss:.4f}", val=f"{avg_val_loss:.4f}", best_loss=f"{best_val_loss:.4f}")
+
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            torch.save(model.state_dict(), "dual_pix2seq_best_loss.pth")
+
+        # ── Evaluation (mAP) ──────────────────────────────────────────────────
+        if (epoch + 1) % EVAL_EVERY == 0 or epoch >= (EPOCHS - 20):
+            res = evaluate_dual(model, val_loader, device=device)
+            tqdm.write(
+                f"Epoch {epoch+1:3d} | Val Loss: {avg_val_loss:.4f} | "
+                f"Segm mAP: {res['segm_map']:.4f} | Segm mAP@50: {res['segm_map_50']:.4f} | "
+                f"BBox mAP: {res['bbox_map']:.4f}"
+            )
+
+            if res["segm_map"] > best_segm_map:
+                best_segm_map = res["segm_map"]
+                torch.save(model.state_dict(), "dual_pix2seq_best_map.pth")
+                tqdm.write(f"  ✓ New best Segm mAP: {best_segm_map:.4f} -> saved dual_pix2seq_best_map.pth")
+
+        torch.save(model.state_dict(), "dual_pix2seq_last.pth")
