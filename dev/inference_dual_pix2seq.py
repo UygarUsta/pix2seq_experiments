@@ -1,11 +1,13 @@
 import os
 import json
 import time
+from glob import glob
 import numpy as np
 import torch
 import torchvision.transforms.functional as TF
 from torchvision import transforms
 from PIL import Image, ImageDraw
+from tqdm import tqdm
 
 from dual_decoder_pix2seq import (
     DualPix2SeqModel, dual_ar_decode,
@@ -23,6 +25,8 @@ PALETTE = [
 ]
 
 
+# ── Preprocessing & Resolution Helpers ─────────────────────────────────────────
+
 def pad_to_square_infer(img):
     w, h = img.size
     max_dim = max(w, h)
@@ -31,7 +35,17 @@ def pad_to_square_infer(img):
     return new_img, max_dim
 
 
+def resolve_image_path(image_path):
+    if not os.path.exists(image_path) or image_path.endswith(".json"):
+        base = os.path.splitext(image_path)[0]
+        for ext in [".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".JPG", ".JPEG", ".PNG"]:
+            if os.path.exists(base + ext):
+                return base + ext
+    return image_path
+
+
 def preprocess_image(image_path):
+    """Returns (tensor[1,3,H,W], padded_pil, orig_w, orig_h, max_dim)."""
     original_img = Image.open(image_path).convert("RGB")
     orig_w, orig_h = original_img.size
     padded_img, max_dim = pad_to_square_infer(original_img)
@@ -40,6 +54,8 @@ def preprocess_image(image_path):
     img_tensor = _NORMALIZE(resized).unsqueeze(0)
     return img_tensor, padded_img, orig_w, orig_h, max_dim
 
+
+# ── Visualization ─────────────────────────────────────────────────────────────
 
 def draw_predictions(padded_img, predictions, orig_w, orig_h, draw_box=True, mask_alpha=0.35):
     base = padded_img.convert("RGBA")
@@ -79,69 +95,147 @@ def load_model(model_path, device):
     return model
 
 
+# ── Batch Inference Logic ─────────────────────────────────────────────────────
+
 @torch.no_grad()
-def predict_and_draw(image_path, model, device, save_json=False, output_path="dual_infer_result.jpg"):
-    img_tensor, padded_img, orig_w, orig_h, max_dim = preprocess_image(image_path)
-    img_tensor = img_tensor.to(device)
+def predict_batch(model, image_paths, device):
+    """
+    Batches image tensors into [B, 3, H, W], executes Decoder 1 for boxes,
+    then executes Decoder 2 in parallel across all detected objects.
+    """
+    tensors, metas = [], []
+    for path in image_paths:
+        p = resolve_image_path(path)
+        if not os.path.exists(p):
+            print(f"  Skipped (not found): {p}")
+            continue
+        t, padded, ow, oh, md = preprocess_image(p)
+        tensors.append(t)
+        metas.append({"path": p, "padded": padded, "w": ow, "h": oh, "max_dim": md})
 
-    # Autoregressive Box Decode -> Parallel Instance Mask Decode
-    raw_results = dual_ar_decode(model, img_tensor, device)[0]
+    if not tensors:
+        return []
 
-    sx = max_dim / float(IMG_SIZE[1])
-    sy = max_dim / float(IMG_SIZE[0])
+    batch = torch.cat(tensors, dim=0).to(device)
+    batch_raw_preds = dual_ar_decode(model, batch, device)
 
-    scaled_predictions = []
-    for r in raw_results:
-        poly = r["polygon"].copy()
-        poly[:, 0] *= sx
-        poly[:, 1] *= sy
+    results = []
+    for i, meta in enumerate(metas):
+        raw_instances = batch_raw_preds[i]
+        sx = meta["max_dim"] / float(IMG_SIZE[1])
+        sy = meta["max_dim"] / float(IMG_SIZE[0])
 
-        box = [r["box"][0] * sx, r["box"][1] * sy, r["box"][2] * sx, r["box"][3] * sy]
-        label_str = ID_TO_LABEL.get(r["label"], "unknown")
+        scaled_predictions = []
+        for r in raw_instances:
+            poly = r["polygon"].copy()
+            poly[:, 0] *= sx
+            poly[:, 1] *= sy
 
-        scaled_predictions.append({
-            "label": label_str,
-            "box": box,
-            "polygon": poly.tolist(),
-            "score": r["score"],
-        })
+            box = [r["box"][0] * sx, r["box"][1] * sy, r["box"][2] * sx, r["box"][3] * sy]
+            label_str = ID_TO_LABEL.get(r["label"], "unknown")
 
-    result_img = draw_predictions(padded_img, scaled_predictions, orig_w, orig_h)
-    result_img.save(output_path)
+            scaled_predictions.append({
+                "label": label_str,
+                "box": box,
+                "polygon": poly.tolist(),
+                "score": r["score"],
+            })
 
-    if save_json:
-        shapes = [{
-            "label": p["label"],
-            "points": p["polygon"],
-            "group_id": None,
-            "shape_type": "polygon",
-            "flags": {},
-        } for p in scaled_predictions]
+        results.append({**meta, "predictions": scaled_predictions})
+
+    return results
+
+
+def predict_folder(image_paths, model, device, batch_size=8, save_json=False, out_dir="test_output"):
+    os.makedirs(out_dir, exist_ok=True)
+
+    for i in tqdm(range(0, len(image_paths), batch_size), desc="Batch Inference"):
+        chunk = image_paths[i:i + batch_size]
+        batch_results = predict_batch(model, chunk, device)
+
+        for r in batch_results:
+            result_img = draw_predictions(r["padded"], r["predictions"], r["w"], r["h"])
+            out_img_path = os.path.join(out_dir, os.path.basename(r["path"]))
+            result_img.save(out_img_path)
+
+            if save_json:
+                shapes = [{
+                    "label": p["label"],
+                    "points": p["polygon"],
+                    "group_id": None,
+                    "shape_type": "polygon",
+                    "flags": {},
+                } for p in r["predictions"]]
+                
+                json_path = os.path.splitext(out_img_path)[0] + ".json"
+                with open(json_path, "w", encoding="utf-8") as f:
+                    json.dump({
+                        "version": "5.0.1",
+                        "flags": {},
+                        "shapes": shapes,
+                        "imagePath": os.path.basename(r["path"]),
+                        "imageHeight": r["h"],
+                        "imageWidth": r["w"]
+                    }, f, ensure_ascii=False, indent=2)
+
+
+def benchmark(model, image_path, device, runs=5):
+    path = resolve_image_path(image_path)
+    t, _, _, _, _ = preprocess_image(path)
+    img = t.to(device)
+
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    dual_ar_decode(model, img, device)  # Warmup
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+    t0 = time.perf_counter()
+    for _ in range(runs):
+        dual_ar_decode(model, img, device)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
         
-        json_path = os.path.splitext(output_path)[0] + ".json"
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump({
-                "version": "5.0.1",
-                "flags": {},
-                "shapes": shapes,
-                "imagePath": os.path.basename(image_path),
-                "imageHeight": orig_h,
-                "imageWidth": orig_w
-            }, f, ensure_ascii=False, indent=2)
+    dt = (time.perf_counter() - t0) / runs
+    print(f"  Dual-Decoder Inference Latency: {dt * 1000:7.1f} ms/img")
 
-    print(f"Decoded {len(scaled_predictions)} instances -> '{output_path}'")
-    return scaled_predictions
 
+# ── Execution Entrypoint ──────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    TEST_IMG   = "/home/uygarusta/datasets/card_merged_datasets/merged_datasets/ruhsat_1ece4a35-2228-4f86-b6de-b80d3c066745.jpg"
-    MODEL_PATH = "dual_pix2seq_best.pth"
+    TEST_IMG_PATH  = "" #"/home/uygarusta/datasets/card_merged_datasets/merged_datasets/ruhsat_1ece4a35-2228-4f86-b6de-b80d3c066745.jpg"
+    MODEL_PATH     = "dual_pix2seq_best_map.pth"
+    DATA_DIR       = "/mnt/d/Datasets/person.v2i.coco-segmentation/train"
+    VAL_SPLIT_PATH = "val_split.json"
+    FOLDER_PATH    = ""  # Set path if running inference on an arbitrary folder
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Running inference on {device}...")
 
-    if os.path.exists(MODEL_PATH) and os.path.exists(TEST_IMG):
-        model = load_model(MODEL_PATH, device)
-        predict_and_draw(TEST_IMG, model, device, save_json=True)
-    else:
-        print("Check MODEL_PATH and TEST_IMG paths.")
+    model = load_model(MODEL_PATH, device)
+
+    # 1. Single Image Test
+    if os.path.exists(TEST_IMG_PATH):
+        single_result = predict_batch(model, [TEST_IMG_PATH], device)
+        if single_result:
+            r = single_result[0]
+            img = draw_predictions(r["padded"], r["predictions"], r["w"], r["h"])
+            img.save("dual_single_infer_result.jpg")
+            print(f"Single image result saved ({len(r['predictions'])} detected) -> 'dual_single_infer_result.jpg'")
+
+        print("\nLatency Test:")
+        benchmark(model, TEST_IMG_PATH, device)
+
+    # 2. Arbitrary Folder Inference
+    if FOLDER_PATH and os.path.exists(FOLDER_PATH):
+        folder_paths = [p for p in glob(os.path.join(FOLDER_PATH, "*")) if not p.endswith(".json")]
+        print(f"\nRunning batch inference on folder: {FOLDER_PATH} ({len(folder_paths)} images)")
+        predict_folder(folder_paths, model, device, batch_size=8, save_json=True, out_dir="test_output_folder")
+
+    # 3. Validation Set Inference
+    if VAL_SPLIT_PATH and os.path.exists(VAL_SPLIT_PATH):
+        print(f"\nRunning batch inference on validation split: {VAL_SPLIT_PATH}")
+        with open(VAL_SPLIT_PATH) as f:
+            val_filenames = json.load(f)["filenames"]
+        val_paths = [os.path.join(DATA_DIR, f) for f in val_filenames]
+        predict_folder(val_paths, model, device, batch_size=8, save_json=True, out_dir="test_output_val")
