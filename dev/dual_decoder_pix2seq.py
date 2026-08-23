@@ -14,7 +14,7 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from tqdm import tqdm
 
-from instance_seg_eval_utils_dual_pix2seq import evaluate_dual
+
 
 # --- CONFIGURATION ---
 JSON_DIR       = "/home/uygarusta/datasets/card_merged_datasets/merged_datasets/"
@@ -509,7 +509,7 @@ if __name__ == "__main__":
         total_steps=total_steps,
         pct_start=0.05
     )
-
+    from instance_seg_eval_utils_dual_pix2seq import evaluate_dual
     EVAL_EVERY    = 4
     best_val_loss = float("inf")
     best_segm_map = 0.0
