@@ -1,0 +1,50 @@
+python dual_decoder_pix2seq.py
+Dual-Decoder Pix2Seq (COCO) | device=cuda | img=(640, 640) | batch=16x4=64 | enc=6L dec=6Lx2 | vocab=584
+COCO index kuruluyor: ./coco_dataset/annotations/instances_val2017.json  (bir kez, sonra ./cocoidx_instances_val2017_a16_e1.npz okunur)
+  görüntü 5000 | nesne 36033 | atlanan: crowd 446, rle 0, küçük 302
+Train: 118287 | Val: 5000
+  ep   2 | train 7.6868 | val 10.5661 | lr 4.95e-04 | segm mAP 0.0000 @50 0.0000 | bbox mAP 0.0056 | pred/img 4.6
+  ep   4 | train 5.5502 | val 8.3709 | lr 4.74e-04 | segm mAP 0.0071 @50 0.0232 | bbox mAP 0.0264 | pred/img 15.5
+       ✓ yeni en iyi segm mAP 0.0071
+  ep   6 | train 4.7723 | val 7.4782 | lr 4.54e-04 | segm mAP 0.0421 @50 0.0927 | bbox mAP 0.0791 | pred/img 12.1
+       ✓ yeni en iyi segm mAP 0.0421
+  ep   8 | train 4.4400 | val 7.0253 | lr 4.33e-04 | segm mAP 0.0762 @50 0.1425 | bbox mAP 0.1106 | pred/img 20.8
+       ✓ yeni en iyi segm mAP 0.0762
+  ep  10 | train 4.2291 | val 6.7265 | lr 4.12e-04 | segm mAP 0.1159 @50 0.2136 | bbox mAP 0.1584 | pred/img 16.8
+       ✓ yeni en iyi segm mAP 0.1159
+  ep  12 | train 4.1065 | val 6.6036 | lr 3.92e-04 | segm mAP 0.1324 @50 0.2318 | bbox mAP 0.1793 | pred/img 23.8
+       ✓ yeni en iyi segm mAP 0.1324
+  ep  14 | train 4.0033 | val 6.3927 | lr 3.71e-04 | segm mAP 0.1616 @50 0.2713 | bbox mAP 0.2049 | pred/img 21.2
+       ✓ yeni en iyi segm mAP 0.1616
+  ep  16 | train 3.9314 | val 6.2935 | lr 3.51e-04 | segm mAP 0.1847 @50 0.3159 | bbox mAP 0.2445 | pred/img 16.5
+       ✓ yeni en iyi segm mAP 0.1847
+  ep  18 | train 3.8616 | val 6.2136 | lr 3.30e-04 | segm mAP 0.1684 @50 0.2825 | bbox mAP 0.2172 | pred/img 17.9
+  ep  20 | train 3.8146 | val 6.1228 | lr 3.09e-04 | segm mAP 0.2023 @50 0.3304 | bbox mAP 0.2531 | pred/img 18.9
+       ✓ yeni en iyi segm mAP 0.2023
+  ep  22 | train 3.7714 | val 6.0878 | lr 2.89e-04 | segm mAP 0.2117 @50 0.3438 | bbox mAP 0.2667 | pred/img 16.6
+       ✓ yeni en iyi segm mAP 0.2117
+  ep  24 | train 3.7448 | val 6.0038 | lr 2.68e-04 | segm mAP 0.2116 @50 0.3494 | bbox mAP 0.2649 | pred/img 22.8
+  ep  26 | train 3.7100 | val 5.9609 | lr 2.47e-04 | segm mAP 0.2115 @50 0.3454 | bbox mAP 0.2633 | pred/img 16.8
+  ep  28 | train 3.6736 | val 5.9108 | lr 2.27e-04 | segm mAP 0.2332 @50 0.3922 | bbox mAP 0.2888 | pred/img 22.8
+       ✓ yeni en iyi segm mAP 0.2332
+  ep  30 | train 3.6531 | val 5.8507 | lr 2.06e-04 | segm mAP 0.2468 @50 0.4138 | bbox mAP 0.3037 | pred/img 17.9
+       ✓ yeni en iyi segm mAP 0.2468
+  ep  32 | train 3.6251 | val 5.8160 | lr 1.86e-04 | segm mAP 0.2476 @50 0.4082 | bbox mAP 0.3073 | pred/img 19.4
+       ✓ yeni en iyi segm mAP 0.2476
+  ep  34 | train 3.5939 | val 5.8096 | lr 1.65e-04 | segm mAP 0.2464 @50 0.4082 | bbox mAP 0.3051 | pred/img 24.4
+  ep  36 | train 3.5742 | val 5.7631 | lr 1.44e-04 | segm mAP 0.2550 @50 0.4217 | bbox mAP 0.3056 | pred/img 21.3
+       ✓ yeni en iyi segm mAP 0.2550
+  ep  38 | train 3.5577 | val 5.7353 | lr 1.24e-04 | segm mAP 0.2516 @50 0.4241 | bbox mAP 0.3133 | pred/img 22.3
+  ep  40 | train 3.5309 | val 5.7171 | lr 1.03e-04 | segm mAP 0.2586 @50 0.4222 | bbox mAP 0.3192 | pred/img 23.9
+       ✓ yeni en iyi segm mAP 0.2586
+  ep  42 | train 3.5073 | val 5.6768 | lr 8.25e-05 | segm mAP 0.2558 @50 0.4312 | bbox mAP 0.3164 | pred/img 19.8
+  ep  44 | train 3.4923 | val 5.6447 | lr 6.19e-05 | segm mAP 0.2735 @50 0.4443 | bbox mAP 0.3257 | pred/img 23.0
+       ✓ yeni en iyi segm mAP 0.2735
+  ep  46 | train 3.4735 | val 5.6308 | lr 4.12e-05 | segm mAP 0.2748 @50 0.4501 | bbox mAP 0.3377 | pred/img 22.3
+       ✓ yeni en iyi segm mAP 0.2748
+  ep  48 | train 3.4515 | val 5.6022 | lr 2.06e-05 | segm mAP 0.2822 @50 0.4605 | bbox mAP 0.3429 | pred/img 21.8
+       ✓ yeni en iyi segm mAP 0.2822
+  ep  50 | train 3.4470 | val 5.5919 | lr 0.00e+00 | segm mAP 0.2820 @50 0.4582 | bbox mAP 0.3385 | pred/img 21.5
+Epochs: 100%|██████████████| 50/50 [15:57:49<00:00, 1149.39s/ep, best_map=0.2822, lr=0.00e+00, train=3.4470, val=5.5919]
+
+Bitti. En iyi segm mAP: 0.2822 -> dual_p2s_coco_best_map.pth
